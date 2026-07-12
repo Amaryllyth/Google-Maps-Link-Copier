@@ -1,0 +1,37 @@
+{
+    "manifest_version": 3,
+    "name": "Google Maps Link Copier",
+    "version": "1.1",
+    "description": "Press a shortcut to copy the original name and short share link of a Google Maps place.",
+    "permissions": [
+      "activeTab",
+      "scripting"
+    ],
+    "icons": {
+      "16": "icon.png",
+      "32": "icon.png",
+      "48": "icon.png",
+      "128": "icon.png"
+    },
+    "action": {
+      "default_icon": {
+        "16": "icon.png",
+        "32": "icon.png",
+        "48": "icon.png",
+        "128": "icon.png"
+      },
+      "default_title": "Copy Markdown Link"
+    },
+    "background": {
+      "service_worker": "background.js"
+    },
+    "commands": {
+      "_execute_action": {
+        "suggested_key": {
+          "default": "Ctrl+Shift+C",
+          "mac": "Command+Shift+C"
+        },
+        "description": "Copy map link to clipboard"
+      }
+    }
+  }
