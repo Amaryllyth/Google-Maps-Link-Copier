@@ -3,6 +3,10 @@ chrome.action.onClicked.addListener((tab) => {
   if (tab.url && /^https?:\/\/(www\.)?google\.[^/]+\/maps/.test(tab.url)) {
     chrome.scripting.executeScript({
       target: { tabId: tab.id },
+      // MAIN world: the new share dialog never puts the short link in the DOM, it
+      // only hands it to navigator.clipboard. Catching that call means patching
+      // the page's own Clipboard.prototype, which the isolated world can't see.
+      world: "MAIN",
       function: getShortLinkAndCopy
     });
   }
@@ -39,10 +43,16 @@ async function getShortLinkAndCopy() {
     return !cs || (cs.display !== "none" && cs.visibility !== "hidden");
   };
 
-  const openDialog = () => [...document.querySelectorAll(DIALOG)].find(isVisible) || null;
+  // Visible is not enough either: Maps keeps a few role="dialog" nodes on screen
+  // at all times (the zoom control, the 0×0 map "reveal" card). Only a modal one
+  // — which the share dialog is, old and new — counts as open.
+  const SHARE_DIALOG =
+    '[aria-modal="true"],[role="alertdialog"],[jslog*="sharekitweb"],:has(button[jsaction*="modal.close"])';
+  const openDialog = () =>
+    [...document.querySelectorAll(DIALOG)].find((el) => isVisible(el) && el.matches(SHARE_DIALOG)) || null;
 
   const CLOSE_BTN =
-    'button[jsaction*="modal.close"],button[aria-label="關閉"],button[aria-label="关闭"],' +
+    '#header-close-button,button[jsaction*="modal.close"],button[aria-label="關閉"],button[aria-label="关闭"],' +
     'button[aria-label="Close"],button[aria-label="閉じる"],button[aria-label="닫기"]';
 
   // One synchronous attempt. Returns true when nothing is left to close.
@@ -124,9 +134,16 @@ async function getShortLinkAndCopy() {
       'button[aria-label="共有"],button[aria-label="공유"]'
     )
   ].filter((btn) => !inDialog(btn));
-  // Prefer a visible button (Maps keeps hidden panes around), but never let the
+  // With the search results list open beside the place, the list has its own
+  // "分享" button (shares the whole list) that comes first in DOM order. Rank the
+  // place's own button (jslog 13534, inside the place pane) ahead of it. Prefer a
+  // visible button (Maps keeps hidden panes around), but never let the
   // visibility probe be the reason we find nothing.
-  const shareBtn = shareCandidates.find(isVisible) || shareCandidates[0];
+  const rank = (btn) =>
+    (isVisible(btn) ? 0 : 4) +
+    (btn.matches('[jslog^="13534"]') ? 0 : 2) +
+    (mainPane && mainPane.contains(btn) ? 0 : 1);
+  const shareBtn = shareCandidates.sort((a, b) => rank(a) - rank(b))[0];
 
   if (!shareBtn) {
     alert("Share button not found. Please make sure the place details are expanded.");
@@ -138,26 +155,82 @@ async function getShortLinkAndCopy() {
   for (const el of document.querySelectorAll("input[readonly]")) before.set(el, el.value);
   const isFresh = (el) => !before.has(el) || before.get(el) !== el.value;
 
+  // The new share dialog ("sharekit") shows only the domain of the short link.
+  // The link itself exists only in what its "Copy Link" button passes to the
+  // clipboard, so catch those calls (and swallow them — the clipboard is about to
+  // get the Markdown link anyway). Restored as soon as the poll below ends.
+  const SHORT_URL = /https?:\/\/(?:maps\.app\.)?goo\.gl\/[^\s"'<>]+/;
+  let copied = "";
+  const clip = window.Clipboard && Clipboard.prototype;
+  const origClip = clip && { write: clip.write, writeText: clip.writeText };
+  const onCopy = (e) => {
+    // execCommand("copy") path: the page fills clipboardData or selects a field.
+    const el = document.activeElement;
+    copied =
+      (e.clipboardData && e.clipboardData.getData("text/plain")) ||
+      (el && el.value != null ? el.value.slice(el.selectionStart, el.selectionEnd) : "") ||
+      String(getSelection());
+  };
+  if (clip) {
+    clip.writeText = async function (data) {
+      copied = String(data);
+    };
+    clip.write = async function (items) {
+      for (const item of items || []) {
+        if (item.types.includes("text/plain")) copied = await (await item.getType("text/plain")).text();
+      }
+    };
+  }
+  window.addEventListener("copy", onCopy);
+
+  const COPY_LINK = /copy|複製|复制|コピー|복사|copiar|copier|kopieren|copia|копир/i;
+  let copyClickedAt = 0;
+
   shareBtn.click();
 
   // 3. Wait for the short link to be generated (poll every 100ms, max 6 seconds).
-  //    Prefer the dialog's own input, but fall back to a page-wide search in case
-  //    Maps renders the share panel without a dialog role — timing out here would
-  //    be far worse than a slightly wider search, and isFresh keeps it honest.
+  //    New UI: click the dialog's "Copy Link" and read what it copies. Old UI:
+  //    read the dialog's readonly input — prefer the dialog's own, but fall back
+  //    to a page-wide search in case Maps renders the share panel without a
+  //    dialog role; timing out would be far worse, and isFresh keeps it honest.
   let shortUrl = "";
-  const deadline = Date.now() + 6000;
-  while (Date.now() < deadline) {
-    await sleep(100);
-    const dialog = openDialog();
-    const pool = [
-      ...(dialog ? dialog.querySelectorAll("input[readonly]") : []),
-      ...document.querySelectorAll("input[readonly]")
-    ];
-    const input = pool.find((el) => /goo\.gl/.test(el.value) && isFresh(el));
-    if (input) {
-      shortUrl = input.value.trim();
-      break;
+  try {
+    const deadline = Date.now() + 6000;
+    while (Date.now() < deadline) {
+      await sleep(100);
+
+      const hit = copied.match(SHORT_URL);
+      if (hit) {
+        shortUrl = hit[0];
+        break;
+      }
+
+      const dialog = openDialog();
+      const pool = [
+        ...(dialog ? dialog.querySelectorAll("input[readonly]") : []),
+        ...document.querySelectorAll("input[readonly]")
+      ];
+      const input = pool.find((el) => /goo\.gl/.test(el.value) && isFresh(el));
+      if (input) {
+        shortUrl = input.value.trim();
+        break;
+      }
+
+      // Re-click only if a copy produced no short link (e.g. clicked before the
+      // link was generated), and not more often than every 500ms.
+      if (Date.now() - copyClickedAt < 500) continue;
+      const copyBtn = [
+        ...(dialog || document).querySelectorAll('[data-skw-id="app-sharing"] [role="button"]')
+      ].find((el) => COPY_LINK.test(`${el.id} ${text(el)}`));
+      if (copyBtn) {
+        copied = "";
+        copyClickedAt = Date.now();
+        copyBtn.click();
+      }
     }
+  } finally {
+    if (clip) Object.assign(clip, origClip);
+    window.removeEventListener("copy", onCopy);
   }
 
   // 4. Close the share dialog. The first attempt is synchronous so focus is back
